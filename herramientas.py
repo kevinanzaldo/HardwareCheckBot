@@ -2,9 +2,10 @@
 import logging
 import unicodedata
 import httpx
+import rag
 
 logger = logging.getLogger("hardwarecheckbot")
-TIEMPO_ESPERA = 10
+TIEMPO_ESPERA = 5
 
 TIPOS_DOLAR = ["oficial", "blue", "tarjeta", "bolsa"]
 
@@ -63,6 +64,17 @@ async def calcular_consumo_psu(tdp_cpu_watts: int, tdp_gpu_watts: int, overclock
     }
 
 
+async def buscar_en_manual(consulta: str) -> dict:
+    """Busca información técnica en el manual de referencia de RigDoctor (RAG)."""
+    resultados = await rag.buscar(consulta)
+    if not resultados:
+        return {
+            "resultados": [],
+            "aviso": "El manual técnico de RigDoctor no contiene información sobre esta consulta.",
+        }
+    return {"resultados": resultados}
+
+
 # --- 2. Declaraciones JSON Schema para Gemini ---
 
 DECLARACIONES = [
@@ -113,6 +125,26 @@ DECLARACIONES = [
             "required": ["tdp_cpu_watts", "tdp_gpu_watts"],
         },
     },
+    {
+        "type": "function",
+        "name": "buscar_en_manual",
+        "description": (
+            "Busca en el manual técnico de referencia de RigDoctor información sobre códigos de error "
+            "(EZ Debug LED, Q-Codes ASUS, pitidos BIOS), conflictos entre puertos M.2 y SATA, "
+            "distribución de líneas PCIe y reglas de instalación de RAM/GPU. "
+            "Usala SIEMPRE ante consultas de diagnóstico de LEDs, códigos POST o conflictos de puertos."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "consulta": {
+                    "type": "string",
+                    "description": "Palabras clave de la consulta técnica, por ejemplo: 'Q-Code 55 ASUS' o 'puertos SATA deshabilitados M2_2 B550'.",
+                },
+            },
+            "required": ["consulta"],
+        },
+    },
 ]
 
 # --- 3. Despachador ---
@@ -120,6 +152,7 @@ DECLARACIONES = [
 FUNCIONES = {
     "obtener_cotizacion_dolar": obtener_cotizacion_dolar,
     "calcular_consumo_psu": calcular_consumo_psu,
+    "buscar_en_manual": buscar_en_manual,
 }
 
 async def ejecutar_funcion(nombre: str, argumentos: dict) -> dict:

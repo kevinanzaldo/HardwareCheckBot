@@ -1,4 +1,5 @@
 # bot.py
+import base64
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from telegram.ext import (
 )
 
 import db
+import rag
 from analisis import analizar_presupuesto
 from herramientas import DECLARACIONES, ejecutar_funcion
 from prompts import PROMPT_SISTEMA
@@ -26,8 +28,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-MAX_MENSAJES_HISTORIAL = 20
+MAX_MENSAJES_HISTORIAL = 10
 MAX_VUELTAS_HERRAMIENTAS = 5
+DURACION_MAXIMA_VOZ = 60
 LIMITE_TELEGRAM = 4096
 
 logging.basicConfig(
@@ -39,17 +42,23 @@ logger = logging.getLogger("hardwarecheckbot")
 
 cliente_gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[dict]:
+
+def armar_entrada(historial: list[tuple[str, str]], contenido_nuevo: list[dict]) -> list[dict]:
     tipo_de_paso = {"user": "user_input", "model": "model_output"}
     pasos = [
         {"type": tipo_de_paso[rol], "content": [{"type": "text", "text": texto}]}
         for rol, texto in historial
     ]
-    pasos.append({"type": "user_input", "content": [{"type": "text", "text": mensaje_nuevo}]})
+    pasos.append({"type": "user_input", "content": contenido_nuevo})
     return pasos
 
-async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
-    entrada = armar_entrada(historial, mensaje)
+
+async def consultar_gemini(
+    historial: list[tuple[str, str]],
+    contenido_nuevo: list[dict],
+    registro: list[str] | None = None,
+) -> str:
+    entrada = armar_entrada(historial, contenido_nuevo)
 
     for _ in range(MAX_VUELTAS_HERRAMIENTAS):
         interaccion = await cliente_gemini.aio.interactions.create(
@@ -68,6 +77,8 @@ async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> st
             entrada.append(paso.model_dump())
 
         for llamada in llamadas:
+            if registro is not None:
+                registro.append(llamada.name)
             resultado = await ejecutar_funcion(llamada.name, llamada.arguments)
             entrada.append({
                 "type": "function_result",
@@ -79,6 +90,7 @@ async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> st
     logger.warning("Se alcanzó el máximo de %d vueltas de herramientas", MAX_VUELTAS_HERRAMIENTAS)
     return "No pude completar el diagnóstico técnico con las herramientas. ¿Podés reformular?"
 
+
 def describir_error(error: Exception) -> str:
     codigo = getattr(error, "status_code", None)
     if codigo == 429:
@@ -87,14 +99,16 @@ def describir_error(error: Exception) -> str:
         return "Error de credenciales de la API de IA. Avisale al administrador."
     return "Ocurrió una falla técnica al procesar tu consulta. ¿Podés repetirla?"
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     nombre = update.effective_user.first_name
     await update.message.reply_text(
-        f"¡Hola, {nombre}! Soy RigDoctor v5, tu asistente inteligente de hardware.\n\n"
-        "Puedo validar compatibilidades, calcular consumos de fuentes, buscar precios reales en Argentina "
-        "y auditar presupuestos completos.\n\n"
+        f"¡Hola, {nombre}! Soy RigDoctor v6, tu asistente inteligente de hardware.\n\n"
+        "Puedo validar compatibilidades, consultar manuales técnicos (LEDs, Q-Codes, líneas PCIe), "
+        "calcular consumos de fuentes, cotizar en dólares, analizar fotos/notas de voz y auditar presupuestos.\n\n"
         "Escribí /help para ver todos los comandos."
     )
+
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -104,13 +118,15 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/olvidar - Borra la memoria de conversación\n"
         "/analizar <lista de piezas> - Audita un presupuesto de PC de forma estructurada\n"
         "/estadisticas - Muestra el resumen de presupuestos analizados\n\n"
-        "También podés preguntarme directamente por precios de hardware o cálculo de watts."
+        "También podés enviarme fotos de hardware o notas de voz con tus consultas."
     )
+
 
 async def olvidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     borrados = await db.borrar_historial(update.effective_user.id)
     logger.info("Usuario %s borró %d mensajes", update.effective_user.id, borrados)
     await update.message.reply_text("Historial borrado. Banco de pruebas limpio. ¿Qué consulta de hardware tenés?")
+
 
 async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     texto = " ".join(context.args).strip()
@@ -145,6 +161,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Diagnóstico: {resultado.observacion_tecnica}"
     )
 
+
 async def estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     datos = await db.resumen_presupuestos()
     if datos["cantidad"] == 0:
@@ -159,32 +176,82 @@ async def estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Cuello nulo: {conteo.get('nulo', 0)} | Leve: {conteo.get('leve', 0)} | Severo: {conteo.get('severo', 0)}"
     )
 
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    texto = update.message.text
-    logger.info("Mensaje de %s: %s", user_id, texto)
 
+async def procesar_mensaje(update: Update, contenido: list[dict], texto_para_historial: str) -> None:
+    user_id = update.effective_user.id
     await update.message.chat.send_action(ChatAction.TYPING)
     historial = await db.obtener_historial(user_id, MAX_MENSAJES_HISTORIAL)
 
     try:
-        respuesta = await consultar_gemini(historial, texto)
+        respuesta = await consultar_gemini(historial, contenido)
     except Exception as error:
         logger.exception("Error al consultar a Gemini")
         await update.message.reply_text(describir_error(error))
         return
 
-    await db.guardar_intercambio(user_id, texto, respuesta)
+    await db.guardar_intercambio(user_id, texto_para_historial, respuesta)
 
     for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
         await update.message.reply_text(respuesta[inicio : inicio + LIMITE_TELEGRAM])
 
+
+async def responder_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    foto = update.message.photo[-1]
+    archivo = await foto.get_file()
+    datos = await archivo.download_as_bytearray()
+
+    leyenda = update.message.caption or "Analizá esta imagen de hardware: identificá componentes, posibles errores de conexión, LEDs de diagnóstico o códigos en pantalla."
+    logger.info("Foto de %s (%d KB): %s", update.effective_user.id, len(datos) // 1024, leyenda)
+
+    contenido = [
+        {"type": "text", "text": leyenda},
+        {
+            "type": "image",
+            "data": base64.b64encode(datos).decode("ascii"),
+            "mime_type": "image/jpeg",
+        },
+    ]
+    await procesar_mensaje(update, contenido, f"[El usuario envió una foto] {leyenda}")
+
+
+async def responder_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    voz = update.message.voice
+    if voz.duration > DURACION_MAXIMA_VOZ:
+        await update.message.reply_text(
+            f"Tu audio dura más de {DURACION_MAXIMA_VOZ} segundos. Enviame una nota de voz más corta."
+        )
+        return
+
+    archivo = await voz.get_file()
+    datos = await archivo.download_as_bytearray()
+    logger.info("Voz de %s (%d s)", update.effective_user.id, voz.duration)
+
+    contenido = [
+        {"type": "text", "text": "El usuario envió esta nota de voz sobre hardware. Respondé directamente a su consulta."},
+        {
+            "type": "audio",
+            "data": base64.b64encode(datos).decode("ascii"),
+            "mime_type": "audio/ogg",
+        },
+    ]
+    await procesar_mensaje(update, contenido, "[El usuario envió un mensaje de voz]")
+
+
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    texto = update.message.text
+    logger.info("Mensaje de %s: %s", update.effective_user.id, texto)
+    await procesar_mensaje(update, [{"type": "text", "text": texto}], texto)
+
+
 async def manejar_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Excepción general: %s", context.error)
 
+
 async def al_iniciar(app: Application) -> None:
     await db.inicializar()
+    rag.inicializar(cliente_gemini)
     logger.info("Base de datos de RigDoctor lista (%s).", db.RUTA_DB)
+
 
 def main() -> None:
     faltantes = [n for n, v in [("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("GEMINI_API_KEY", GEMINI_API_KEY)] if not v]
@@ -198,11 +265,14 @@ def main() -> None:
     app.add_handler(CommandHandler("olvidar", olvidar))
     app.add_handler(CommandHandler("analizar", analizar))
     app.add_handler(CommandHandler("estadisticas", estadisticas))
+    app.add_handler(MessageHandler(filters.PHOTO, responder_foto))
+    app.add_handler(MessageHandler(filters.VOICE, responder_voz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejar_error)
 
-    logger.info("RigDoctor v5 en línea con modelo %s.", GEMINI_MODEL)
+    logger.info("RigDoctor v6 en línea con modelo %s.", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
